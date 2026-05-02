@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>PDC Assignment 2 - Building Resilient Distributed Systems</title>
+    <style>
+        @page { size: A4; margin: 0.45in; }
+        * { box-sizing: border-box; }
+        body {
+            font-family: Arial, Helvetica, sans-serif;
+            font-size: 10.2px;
+            line-height: 1.34;
+            color: #111827;
+            margin: 0;
+        }
+        h1 {
+            font-size: 17px;
+            text-align: center;
+            margin: 0 0 2px;
+        }
+        .subtitle, .student {
+            text-align: center;
+            margin: 0 0 4px;
+        }
+        h2 {
+            font-size: 13px;
+            margin: 10px 0 5px;
+            border-bottom: 1px solid #374151;
+            padding-bottom: 2px;
+        }
+        h3 {
+            font-size: 11.2px;
+            margin: 7px 0 2px;
+        }
+        p { margin: 0 0 5px; text-align: justify; }
+        ul { margin: 0 0 5px 16px; padding: 0; }
+        li { margin-bottom: 2px; }
+        code {
+            font-family: Consolas, monospace;
+            font-size: 9.5px;
+            background: #f3f4f6;
+            padding: 0 2px;
+        }
+        pre {
+            font-family: Consolas, monospace;
+            font-size: 8.3px;
+            line-height: 1.18;
+            background: #f9fafb;
+            border: 1px solid #d1d5db;
+            padding: 6px;
+            margin: 4px 0 6px;
+            white-space: pre-wrap;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 4px 0 6px;
+            font-size: 9.4px;
+        }
+        th, td {
+            border: 1px solid #d1d5db;
+            padding: 4px;
+            vertical-align: top;
+        }
+        th {
+            background: #eef2ff;
+            text-align: left;
+        }
+    </style>
+</head>
+<body>
+    <h1>Building Resilient Distributed Systems</h1>
+    <p class="subtitle">Parallel and Distributed Computing - Assignment 2</p>
+    <p class="student">Mutee ur Rehman - BSAI23005</p>
+
+    <h2>Part 1: Analyze the Mess</h2>
+    <p>
+        StudySync is a normal FastAPI + React MVP: frontend requests come to the FastAPI backend,
+        the backend writes to a database, receives Clerk webhooks, and calls an external LLM API.
+        The stack works for a demo, but it fails when network timing, retries, and concurrent users
+        become real.
+    </p>
+
+    <h3>Problem 1 - Synchronization</h3>
+    <p>
+        The lost update happens in the document API lifecycle between the first read and the later
+        write. User A and User B both load document version N. User A saves first, so the database
+        now contains A's content. User B then saves using the old copy, and the API runs a normal
+        <code>UPDATE documents SET content = ? WHERE id = ?</code>. Since the query does not check
+        a version number or lock the row, the database accepts B's stale write and silently replaces
+        A's work. The root cause is missing concurrency control at both the API and database layer.
+    </p>
+
+    <h3>Problem 2 - Coordination</h3>
+    <p>
+        Clerk is the source of truth for subscription status, while the StudySync database stores a
+        local copy such as <code>is_premium</code>. In the naive design, a Clerk cancellation webhook
+        is processed once by the backend. If the network drops the POST, the app restarts, or the DB
+        is temporarily unavailable, our side may never record the event. Because there is no durable
+        inbox, no idempotency table, no retry worker, and no reconciliation job, the local database
+        can remain premium forever even though Clerk says the user cancelled.
+    </p>
+
+    <h3>Problem 3 - Fault Tolerance</h3>
+    <p>
+        The LLM call is treated like a normal local function even though it is a remote dependency.
+        When the LLM slows down, the FastAPI handler waits for the HTTP call until a long timeout
+        expires. In a small MVP deployment this can tie up the available worker capacity and make
+        unrelated users wait too. The external LLM becomes a single point of failure because there
+        is no short timeout, no failure counter, no fallback response, and no circuit breaker.
+    </p>
+
+    <h2>Part 2: Design a Better System</h2>
+    <h3>Sync Fix - Optimistic Locking</h3>
+    <p>
+        I would add a <code>version</code> column to every document. The GET endpoint returns the
+        current version with the content. The PUT endpoint requires the client to send that version
+        back. The server updates only if <code>request.version == document.version</code>. If the
+        value is stale, the API returns <code>409 Conflict</code>, so the user refreshes and merges
+        instead of overwriting another person's work.
+    </p>
+
+    <pre>
+UML sequence diagram: two concurrent edits with optimistic locking
+
+Alice            FastAPI API + DB                  Bob
+  | GET /documents/1      |                         |
+  |---------------------->|                         |
+  | 200 content, v=1      |                         |
+  |<----------------------|                         |
+  |                       | GET /documents/1        |
+  |                       |<------------------------|
+  |                       | 200 content, v=1        |
+  |                       |------------------------>|
+  | PUT edits, v=1        |                         |
+  |---------------------->| check v1 == DB v1       |
+  |                       | save Alice, DB v=2      |
+  | 200 OK, v=2           |                         |
+  |<----------------------|                         |
+  |                       | PUT edits, v=1          |
+  |                       |<------------------------|
+  |                       | check v1 != DB v2       |
+  |                       | 409 Conflict            |
+  |                       |------------------------>|
+  |                       | Bob refreshes, merges, retries with v=2
+    </pre>
+
+    <h3>Coordination Fix - Durable Webhook Handling</h3>
+    <ul>
+        <li><strong>Verify and store first:</strong> verify the Clerk/Svix signature, then write the event id, type, and raw payload to a <code>webhook_events</code> table before doing business logic.</li>
+        <li><strong>Idempotency:</strong> use the Clerk/Svix event id as the idempotency key. If the same webhook arrives twice, return 200 and do not apply the cancellation twice.</li>
+        <li><strong>Retry worker:</strong> process events from the durable table or queue with exponential backoff. Failed jobs stay pending instead of disappearing.</li>
+        <li><strong>Dead-letter queue:</strong> after too many failures, move the event to a dead-letter table for manual inspection instead of dropping it.</li>
+        <li><strong>Reconciliation:</strong> run a scheduled job that asks Clerk for the current subscription state and fixes any drift in our database.</li>
+    </ul>
+
+    <h3>Fault Tolerance Fix - Circuit Breaker with Fallback</h3>
+    <p>
+        I implemented this one in code. The protected endpoint calls the LLM through a circuit
+        breaker. In the closed state, requests pass through normally. After 3 consecutive failures,
+        the breaker opens and returns a fallback answer immediately without calling the LLM. After
+        15 seconds, it moves to half-open and allows one test request. If that request succeeds,
+        the breaker closes; if it fails, the breaker opens again. I also use a 5 second HTTP timeout
+        so the app fails fast instead of waiting around 60 seconds.
+    </p>
+
+    <table>
+        <tr><th>State</th><th>Behavior</th><th>Why it helps</th></tr>
+        <tr><td>Closed</td><td>Call the LLM and count failures.</td><td>Normal users still get real LLM answers.</td></tr>
+        <tr><td>Open</td><td>Skip the LLM and return fallback instantly.</td><td>The failing dependency cannot hang the app.</td></tr>
+        <tr><td>Half-open</td><td>Allow one trial request after timeout.</td><td>The system can recover automatically.</td></tr>
+    </table>
+
+    <h3>CAP Trade-offs</h3>
+    <table>
+        <tr><th>Area</th><th>Choice</th><th>Explanation</th></tr>
+        <tr>
+            <td>Document sync</td>
+            <td>Consistency over availability</td>
+            <td>A stale write is rejected with 409. This means one user may need to retry, but no edit is silently lost.</td>
+        </tr>
+        <tr>
+            <td>Webhooks</td>
+            <td>Availability now, eventual consistency later</td>
+            <td>The app accepts and stores events quickly, then retries until the local DB matches Clerk.</td>
+        </tr>
+        <tr>
+            <td>LLM calls</td>
+            <td>Availability and low latency over perfect answer freshness</td>
+            <td>When the LLM is down, a fallback answer is less accurate than a live LLM answer, but the app stays usable.</td>
+        </tr>
+    </table>
+
+    <p>
+        Since network partitions and remote failures are unavoidable, I am not trying to guarantee
+        everything at once. For documents, correctness is more important than accepting every write.
+        For webhooks, temporary inconsistency is acceptable as long as retries and reconciliation
+        eventually fix it. For the LLM, user-facing availability and latency are more important than
+        always waiting for the perfect generated answer.
+    </p>
+</body>
+</html>
